@@ -4,6 +4,7 @@ import argparse
 import json
 from datetime import datetime
 import os
+from pathlib import Path
 import subprocess
 import time
 from multiprocessing import Process
@@ -24,9 +25,12 @@ from netarena.adversary.arms import build_arms, get_arm, arm_to_query
 from netarena.adversary.route_mdp import RouteCurriculumEnv, Outcome
 from netarena.adversary.policy import TabularSarsa
 from netarena.adversary.bandit import MyopicBandit
+from netarena.adversary.lm_mlp_policy import LmMlpPolicy
+from netarena.adversary.verified_ac import VerifiedActorCritic
 
 
-CURRICULUM_MODES = ("random", "bandit", "sarsa")
+CURRICULUM_MODES = ("random", "bandit", "sarsa", "lm_mlp", "verified_ac")
+NEURAL_CURRICULA = ("lm_mlp", "verified_ac")
 
 
 @dataclass
@@ -40,7 +44,7 @@ class AppRouteConfig:
     num_switches: int = 2
     num_hosts_per_subnet: int = 1
     agent_client_configs: list[AgentClientConfig] = field(default_factory=list)
-    # Outer curriculum: random = pre-generated JSON list; bandit/sarsa = online MDP.
+    # Outer curriculum: random = pre-generated JSON list; others = online adversary.
     curriculum: str = "random"
     curriculum_horizon: int | None = None
     curriculum_q_path: str | None = None
@@ -52,6 +56,12 @@ class AppRouteConfig:
     curriculum_repeat_penalty: float = 0.15
     curriculum_seed: int | None = None
     curriculum_train: bool = True
+    curriculum_lm_backend: str = "hash"
+    curriculum_lm_model_name: str | None = None
+    curriculum_lm_embed_dim: int = 128
+    curriculum_lm_lr: float = 1e-3
+    curriculum_entropy_coef: float = 0.01
+    curriculum_value_coef: float = 0.5
 
     def __post_init__(self):
         names = [config.name for config in self.agent_client_configs]
@@ -258,6 +268,41 @@ def _build_curriculum_policy(args: AppRouteConfig, n_arms: int):
             epsilon=args.curriculum_epsilon,
             seed=args.curriculum_seed,
         )
+    if args.curriculum == "lm_mlp":
+        if args.curriculum_q_path and os.path.exists(args.curriculum_q_path):
+            pt = args.curriculum_q_path
+            if not pt.endswith(".pt"):
+                pt = str(Path(pt).with_suffix(".pt"))
+            if os.path.exists(pt):
+                return LmMlpPolicy.load(pt, seed=args.curriculum_seed)
+        return LmMlpPolicy(
+            n_arms,
+            lm_backend=args.curriculum_lm_backend,
+            lm_model_name=args.curriculum_lm_model_name,
+            embed_dim=args.curriculum_lm_embed_dim,
+            lr=args.curriculum_lm_lr,
+            gamma=args.curriculum_gamma,
+            entropy_coef=args.curriculum_entropy_coef,
+            seed=args.curriculum_seed,
+        )
+    if args.curriculum == "verified_ac":
+        if args.curriculum_q_path and os.path.exists(args.curriculum_q_path):
+            pt = args.curriculum_q_path
+            if not pt.endswith(".pt"):
+                pt = str(Path(pt).with_suffix(".pt"))
+            if os.path.exists(pt):
+                return VerifiedActorCritic.load(pt, seed=args.curriculum_seed)
+        return VerifiedActorCritic(
+            n_arms,
+            lm_backend=args.curriculum_lm_backend,
+            lm_model_name=args.curriculum_lm_model_name,
+            embed_dim=args.curriculum_lm_embed_dim,
+            lr=args.curriculum_lm_lr,
+            gamma=args.curriculum_gamma,
+            entropy_coef=args.curriculum_entropy_coef,
+            value_coef=args.curriculum_value_coef,
+            seed=args.curriculum_seed,
+        )
     raise ValueError(f"No online policy for curriculum={args.curriculum!r}")
 
 
@@ -329,6 +374,7 @@ async def evaluate_routing_queries(args: AppRouteConfig, result_dir: str | None 
             )
             policy = _build_curriculum_policy(args, len(arms))
             state = env.reset(horizon)
+            neural = args.curriculum in NEURAL_CURRICULA
             action = policy.select_action(
                 state, greedy=not args.curriculum_train, unvisited=env.unvisited_arms()
             )
@@ -364,16 +410,25 @@ async def evaluate_routing_queries(args: AppRouteConfig, result_dir: str | None 
                 }
 
                 if args.curriculum_train:
-                    if done:
-                        next_action = action
+                    if neural:
+                        # Select-then-step-then-update: do not sample next action before reward.
+                        policy.update(state, action, reward, next_state, action, done=done)
+                        state = next_state
+                        if not done:
+                            action = policy.select_action(
+                                state, unvisited=env.unvisited_arms()
+                            )
                     else:
-                        next_action = policy.select_action(
-                            next_state, unvisited=env.unvisited_arms()
-                        )
-                    policy.update(state, action, reward, next_state, next_action, done=done)
-                    if not done:
-                        action = next_action
-                    state = next_state
+                        if done:
+                            next_action = action
+                        else:
+                            next_action = policy.select_action(
+                                next_state, unvisited=env.unvisited_arms()
+                            )
+                        policy.update(state, action, reward, next_state, next_action, done=done)
+                        if not done:
+                            action = next_action
+                        state = next_state
                 else:
                     state = next_state
                     if not done:

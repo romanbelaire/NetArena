@@ -8,8 +8,9 @@ Modes:
 
 Examples:
   python train_adversary.py --mock --curriculum sarsa --episodes 50 --horizon 8
-  python train_adversary.py --mock --curriculum bandit --episodes 50 --horizon 8
-  python train_adversary.py --mock --curriculum random --episodes 20 --horizon 8
+  python train_adversary.py --mock --curriculum lm_mlp --episodes 40 --horizon 8
+  python train_adversary.py --mock --curriculum verified_ac --episodes 40 --horizon 8
+  python train_adversary.py --mock --compare
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import sys
 from datetime import datetime
@@ -31,8 +31,13 @@ sys.path.insert(0, str(_APP_DIR))
 
 from netarena.adversary.arms import build_arms
 from netarena.adversary.bandit import MyopicBandit
+from netarena.adversary.lm_mlp_policy import LmMlpPolicy
 from netarena.adversary.policy import TabularSarsa
 from netarena.adversary.route_mdp import Outcome, RouteCurriculumEnv
+from netarena.adversary.verified_ac import VerifiedActorCritic
+
+NEURAL = ("lm_mlp", "verified_ac")
+ALL_CURRICULA = ("random", "bandit", "sarsa", "lm_mlp", "verified_ac")
 
 
 def _entropy(visits: list[int]) -> float:
@@ -71,12 +76,11 @@ class MockPurple:
             raise ValueError(f"arm_id out of range: {arm_id}")
         p_fail = self.hard_fail_p if arm_id in self.hard_arms else self.easy_fail_p
         failed = self._rng.random() < p_fail
-        # Unsafe slightly more often on hard arms when failing.
         unsafe = failed and self._rng.random() < (0.3 if arm_id in self.hard_arms else 0.05)
         return Outcome(correct=not failed, safe=not unsafe)
 
 
-def _make_policy(curriculum: str, n_arms: int, args: argparse.Namespace):
+def _make_policy(curriculum: str, n_arms: int, args: argparse.Namespace, arms):
     if curriculum == "sarsa":
         return TabularSarsa(
             n_arms,
@@ -91,6 +95,31 @@ def _make_policy(curriculum: str, n_arms: int, args: argparse.Namespace):
             alpha=args.alpha,
             epsilon=args.epsilon,
             seed=args.seed,
+        )
+    if curriculum == "lm_mlp":
+        return LmMlpPolicy(
+            n_arms,
+            lm_backend=args.lm_backend,
+            lm_model_name=args.lm_model,
+            embed_dim=args.embed_dim,
+            lr=args.lr,
+            gamma=args.gamma,
+            entropy_coef=args.entropy_coef,
+            seed=args.seed,
+            arms=arms,
+        )
+    if curriculum == "verified_ac":
+        return VerifiedActorCritic(
+            n_arms,
+            lm_backend=args.lm_backend,
+            lm_model_name=args.lm_model,
+            embed_dim=args.embed_dim,
+            lr=args.lr,
+            gamma=args.gamma,
+            entropy_coef=args.entropy_coef,
+            value_coef=args.value_coef,
+            seed=args.seed,
+            arms=arms,
         )
     if curriculum == "random":
         return None
@@ -111,6 +140,7 @@ def run_mock_episode(
     early_actions = []
     late_actions = []
     horizon = env.horizon
+    info = {"visits": [0] * env.n_arms, "fails": [0] * env.n_arms, "succs": [0] * env.n_arms}
 
     if curriculum == "random":
         for t in range(horizon):
@@ -125,6 +155,23 @@ def run_mock_episode(
             corrects.append(1 if outcome.correct else 0)
             if done:
                 break
+    elif curriculum in NEURAL:
+        action = policy.select_action(state, unvisited=env.unvisited_arms())
+        for t in range(horizon):
+            if t < max(1, horizon // 3):
+                early_actions.append(action)
+            else:
+                late_actions.append(action)
+            outcome = purple.outcome(action)
+            next_state, reward, done, info = env.step(action, outcome)
+            rewards.append(reward)
+            corrects.append(1 if outcome.correct else 0)
+            policy.update(state, action, reward, next_state, action, done=done)
+            state = next_state
+            if done:
+                break
+            action = policy.select_action(state, unvisited=env.unvisited_arms())
+        policy.decay_epsilon()
     else:
         action = policy.select_action(state, unvisited=env.unvisited_arms())
         for t in range(horizon):
@@ -164,7 +211,7 @@ def train_mock(args: argparse.Namespace) -> Path:
     n_arms = len(arms)
     hard = set(args.hard_arms) if args.hard_arms else {0, 3, 7}
     purple = MockPurple(n_arms, hard, seed=args.seed)
-    policy = _make_policy(args.curriculum, n_arms, args)
+    policy = _make_policy(args.curriculum, n_arms, args, arms)
     env = RouteCurriculumEnv(
         horizon=args.horizon,
         safety_weight=args.safety_weight,
@@ -263,7 +310,7 @@ async def train_live(args: argparse.Namespace) -> None:
                 max_iterations=args.max_iterations,
                 curriculum=args.curriculum,
                 curriculum_horizon=args.horizon,
-                curriculum_q_path=str(q_path) if q_path.exists() else None,
+                curriculum_q_path=str(q_path) if q_path.exists() or Path(str(q_path) + ".pt").exists() or Path(q_path).with_suffix(".pt").exists() else None,
                 curriculum_save_q_path=str(q_path),
                 curriculum_epsilon=args.epsilon,
                 curriculum_alpha=args.alpha,
@@ -272,6 +319,12 @@ async def train_live(args: argparse.Namespace) -> None:
                 curriculum_repeat_penalty=args.repeat_penalty,
                 curriculum_seed=args.seed,
                 curriculum_train=True,
+                curriculum_lm_backend=args.lm_backend,
+                curriculum_lm_model_name=args.lm_model,
+                curriculum_lm_embed_dim=args.embed_dim,
+                curriculum_lm_lr=args.lr,
+                curriculum_entropy_coef=args.entropy_coef,
+                curriculum_value_coef=args.value_coef,
                 num_switches=args.num_switches,
                 num_hosts_per_subnet=args.num_hosts_per_subnet,
                 agent_client_configs=[agent_cfg],
@@ -310,11 +363,11 @@ async def train_live(args: argparse.Namespace) -> None:
 
 
 def compare_mock(args: argparse.Namespace) -> None:
-    """Run random / bandit / sarsa mock trains and write a comparison JSON."""
+    """Run all curricula mock trains and write a comparison JSON."""
     base_out = Path(args.output_dir)
     base_out.mkdir(parents=True, exist_ok=True)
     summaries = {}
-    for curriculum in ("random", "bandit", "sarsa"):
+    for curriculum in ALL_CURRICULA:
         sub = argparse.Namespace(**vars(args))
         sub.curriculum = curriculum
         sub.output_dir = str(base_out / curriculum)
@@ -327,7 +380,7 @@ def compare_mock(args: argparse.Namespace) -> None:
     print("\n=== Comparison (mock purple) ===")
     for k, s in summaries.items():
         print(
-            f"{k:8s} purple_ok={s['overall_purple_success']:.3f} "
+            f"{k:12s} purple_ok={s['overall_purple_success']:.3f} "
             f"adv_fail={s['overall_adv_failure']:.3f} "
             f"earlyH={s['early_episodes_arm_entropy']:.3f} lateH={s['late_episodes_arm_entropy']:.3f}"
         )
@@ -336,7 +389,7 @@ def compare_mock(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Route adversarial curriculum (CPU adversary).")
-    p.add_argument("--curriculum", choices=["random", "bandit", "sarsa"], default="sarsa")
+    p.add_argument("--curriculum", choices=list(ALL_CURRICULA), default="sarsa")
     p.add_argument("--episodes", type=int, default=40)
     p.add_argument("--horizon", type=int, default=8)
     p.add_argument("--epsilon", type=float, default=0.25)
@@ -348,16 +401,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hard-arms", type=int, nargs="*", default=None, help="Mock purple hard arm ids")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--mock", action="store_true", help="Use MockPurple (no Mininet)")
-    p.add_argument("--compare", action="store_true", help="Run random+bandit+sarsa mock comparison")
+    p.add_argument("--compare", action="store_true", help="Run all curricula mock comparison")
     p.add_argument("--purple-url", type=str, default="http://127.0.0.1:8000")
     p.add_argument("--prompt-type", type=str, default="zeroshot_base")
     p.add_argument("--max-iterations", type=int, default=5)
     p.add_argument("--num-switches", type=int, default=2)
     p.add_argument("--num-hosts-per-subnet", type=int, default=1)
+    p.add_argument("--lm-backend", choices=["hash", "hf"], default="hash")
+    p.add_argument("--lm-model", type=str, default=None, help="HF model id when --lm-backend hf")
+    p.add_argument("--embed-dim", type=int, default=128)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--value-coef", type=float, default=0.5)
     args = p.parse_args()
     if args.output_dir is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         args.output_dir = str(_APP_DIR / "output" / "adversary" / stamp)
+    if args.lm_backend == "hf" and not args.lm_model:
+        raise SystemExit("--lm-model is required when --lm-backend hf")
     return args
 
 

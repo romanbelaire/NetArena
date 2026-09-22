@@ -23,12 +23,12 @@ max_iterations = 10
 num_switches = 2
 num_hosts_per_subnet = 1
 
-# Outer curriculum: "random" | "bandit" | "sarsa"
-# random = pre-generated query list; bandit/sarsa = online probe-then-exploit adversary.
+# Outer curriculum: "random" | "bandit" | "sarsa" | "lm_mlp" | "verified_ac"
+# random = pre-generated query list; others = online adversary policy.
 curriculum = "random"
-# Horizon for bandit/sarsa (defaults to num_queries if omitted).
+# Horizon for online curricula (defaults to num_queries if omitted).
 # curriculum_horizon = 10
-# Load / save Q-table paths for bandit/sarsa.
+# Load / save checkpoint paths for online curricula.
 # curriculum_q_path = "output/curriculum_q.json"
 # curriculum_save_q_path = "output/curriculum_q.json"
 curriculum_epsilon = 0.2
@@ -37,6 +37,13 @@ curriculum_gamma = 0.95
 curriculum_safety_weight = 0.25
 curriculum_repeat_penalty = 0.15
 curriculum_train = true
+# LM bridge / verified AC (CPU). backend "hash" needs no HF download; "hf" needs curriculum_lm_model_name.
+curriculum_lm_backend = "hash"
+# curriculum_lm_model_name = "prajjwal1/bert-tiny"
+curriculum_lm_embed_dim = 128
+curriculum_lm_lr = 0.001
+curriculum_entropy_coef = 0.01
+curriculum_value_coef = 0.5
 
 # Agent client configurations.
 [[agent_client_configs]]
