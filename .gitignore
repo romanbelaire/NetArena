@@ -20,6 +20,7 @@ app-k8s/results/*
 app-malt/figs/*
 app-route/results/*
 app-route/result/*
+app-route/output/
 *.log
 app-route/*.txt
 */result/

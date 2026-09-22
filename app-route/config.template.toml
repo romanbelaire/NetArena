@@ -23,6 +23,21 @@ max_iterations = 10
 num_switches = 2
 num_hosts_per_subnet = 1
 
+# Outer curriculum: "random" | "bandit" | "sarsa"
+# random = pre-generated query list; bandit/sarsa = online probe-then-exploit adversary.
+curriculum = "random"
+# Horizon for bandit/sarsa (defaults to num_queries if omitted).
+# curriculum_horizon = 10
+# Load / save Q-table paths for bandit/sarsa.
+# curriculum_q_path = "output/curriculum_q.json"
+# curriculum_save_q_path = "output/curriculum_q.json"
+curriculum_epsilon = 0.2
+curriculum_alpha = 0.1
+curriculum_gamma = 0.95
+curriculum_safety_weight = 0.25
+curriculum_repeat_penalty = 0.15
+curriculum_train = true
+
 # Agent client configurations.
 [[agent_client_configs]]
 name = "azure-gpt"
